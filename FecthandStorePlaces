@@ -1,0 +1,172 @@
+const fs = require('fs').promises;
+const { MongoClient } = require('mongodb');
+
+
+const uri = "mongodb+srv://Vedat:V_15109d@cluster0.qdytppo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"; 
+const client = new MongoClient(uri);
+
+async function findTempClosedPlacesInArea(area, query) {
+    const fetch = (await import('node-fetch')).default;
+    const apiKey = 'AIzaSyBztMxpFNRJtISSDvLyiaqSxyhOXQFLxlE';
+    let searchUrl = '';
+
+    if (area.type === 'circle') {
+        searchUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?key=${apiKey}&location=${area.center.lat},${area.center.lng}&radius=${area.radius}&keyword=${query}`;
+    } else if (area.type === 'rectangle') {
+        console.log("Rectangle search not yet implemented. See Places API (New) documentation");
+        return [];
+    } else {
+        console.error("Unsupported area type.");
+        return [];
+    }
+
+    console.log(`Search URL: ${searchUrl}`);
+
+    let closedPlacesWithReviews = [];
+    let nextPageToken = null;
+
+    try {
+        await client.connect();
+        const database = client.db('placesDB');
+        const restaurantsCollection = database.collection('restaurants');
+        const cafesCollection = database.collection('cafes');
+
+        do {
+            const responseUrl = nextPageToken ? `${searchUrl}&pagetoken=${nextPageToken}` : searchUrl;
+            console.log(`Fetching URL: ${responseUrl}`);
+
+            const searchResponse = await fetch(responseUrl);
+            const searchData = await searchResponse.json();
+            console.log('Search Data:', searchData);
+
+            if (searchData.results) {
+                for (const place of searchData.results) {
+                    const placeId = place.place_id;
+                    let detailsUrl = `https://maps.googleapis.com/maps/api/place/details/json?key=${apiKey}&place_id=${placeId}&fields=name,business_status,user_ratings_total`;
+                    const detailsResponse = await fetch(detailsUrl);
+                    const detailsData = await detailsResponse.json();
+                    console.log('Details Data:', detailsData);
+
+                    const placeData = {
+                        name: detailsData.result ? detailsData.result.name : place.name,
+                        placeId: placeId,
+                        reviewCount: detailsData.result ? detailsData.result.user_ratings_total : 0,
+                        businessStatus: detailsData.result ? detailsData.result.business_status : 'UNKNOWN',
+                        timestamp: new Date()
+                    };
+
+
+                    if (place.types.includes('restaurant')) {
+                        await restaurantsCollection.updateOne(
+                            { placeId: placeId },
+                            { $set: placeData },
+                            { upsert: true }
+                        );
+                        closedPlacesWithReviews.push(placeData);
+                    } else if (place.types.includes('cafe')) {
+                        await cafesCollection.updateOne(
+                            { placeId: placeId },
+                            { $set: placeData },
+                            { upsert: true }
+                        );
+                        closedPlacesWithReviews.push(placeData);
+                    }
+                }
+                nextPageToken = searchData.next_page_token;
+                if (nextPageToken) {
+                    console.log('Waiting for next page token...');
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+            } else {
+                console.log("No places found in the area.");
+                nextPageToken = null;
+            }
+        } while (nextPageToken);
+    } catch (error) {
+        console.error("Error:", error);
+    } finally {
+        await client.close();
+    }
+
+    return closedPlacesWithReviews;
+}
+
+async function writePlacesToFile(restaurants, cafes, restaurantsFilename = 'maslak_closed_restaurants.txt', cafesFilename = 'maslak_closed_cafes.txt') {
+    try {
+
+        async function writePlacesToFileHelper(places, filename) {
+            let existingPlaces = [];
+            try {
+                const fileContent = await fs.readFile(filename, 'utf8');
+                const lines = fileContent.split('\n');
+                for (let i = 0; i < lines.length; i += 5) {
+                    if (lines[i].startsWith('Name:')) {
+                        const name = lines[i].split(': ')[1];
+                        const placeId = lines[i + 1].split(': ')[1];
+                        existingPlaces.push({ name, placeId });
+                    }
+                }
+            } catch (error) {
+                if (error.code !== 'ENOENT') {
+                    console.error('Error reading file:', error);
+                }
+            }
+
+            const updatedPlaces = places.filter(place => !existingPlaces.find(existing => existing.placeId === place.placeId));
+            const allPlaces = [...existingPlaces.map(existing => {
+                const updatedPlace = places.find(place => place.placeId === existing.placeId);
+                return updatedPlace || existing;
+            }), ...updatedPlaces];
+
+            let fileContent = '';
+            for (const place of allPlaces) {
+                fileContent += `Name: ${place.name}\n`;
+                fileContent += `Place ID: ${place.placeId}\n`;
+                fileContent += `Review Count: ${place.reviewCount || 0}\n`;
+                fileContent += `Business Status: ${place.businessStatus || 'UNKNOWN'}\n`;
+                fileContent += '\n'; // Add a blank line between places
+            }
+
+            await fs.writeFile(filename, fileContent, 'utf8');
+            console.log(`Successfully wrote data to ${filename}`);
+        }
+
+
+        if (restaurants.length > 0) {
+            await writePlacesToFileHelper(restaurants, restaurantsFilename);
+        } else {
+            await fs.writeFile(restaurantsFilename, 'No temporarily closed restaurants found.', 'utf8');
+            console.log(`No restaurants to write. Wrote a message to ${restaurantsFilename}`);
+        }
+
+        if (cafes.length > 0) {
+            await writePlacesToFileHelper(cafes, cafesFilename);
+        } else {
+            await fs.writeFile(cafesFilename, 'No temporarily closed cafes found.', 'utf8');
+            console.log(`No cafes to write. Wrote a message to ${cafesFilename}`);
+        }
+    } catch (error) {
+        console.error('Error writing to file:', error);
+    }
+}
+
+
+const maslakArea = {
+    type: 'circle',
+    center: { lat: 41.1125, lng: 29.0200 }, // Maslak, Istanbul
+    radius: 1000 // meters
+};
+
+findTempClosedPlacesInArea(maslakArea, "food")
+    .then(results => {
+        console.log(results);
+
+        const restaurants = results.filter(place => Array.isArray(place.types) && place.types.includes('restaurant'));
+        const cafes = results.filter(place => Array.isArray(place.types) && place.types.includes('cafe'));
+
+
+        return writePlacesToFile(restaurants, cafes);
+    })
+    .catch(error => {
+        console.error("An error occurred:", error);
+    });
